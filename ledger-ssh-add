@@ -1,0 +1,77 @@
+#!/usr/bin/env python
+
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import serialization
+
+from ledgerblue.comm import getDongle
+from ledgerblue.commException import CommException
+
+import argparse
+import struct
+import sys 
+import getpass
+import hashlib
+import subprocess
+
+# Path of SSH App
+path = "44'/535348'/0'/0/0"
+
+def sign_request(challenge, path):  
+    dongle = getDongle()
+    donglePath = parse_bip32_path(path)
+    data = chr(len(donglePath) / 4) + donglePath + challenge
+    apdu = "80080001".decode('hex') + chr(len(data)) + data
+    signature = dongle.exchange(bytes(apdu))
+    dongle.close()
+    return signature
+
+def parse_bip32_path(path):
+        if len(path) == 0:
+                return ""
+        result = ""
+        elements = path.split('/')
+        for pathElement in elements:
+                element = pathElement.split('\'')
+                if len(element) == 1:
+                        result = result + struct.pack(">I", int(element[0]))                    
+                else:
+                        result = result + struct.pack(">I", 0x80000000 | int(element[0]))
+        return result
+
+   
+parser = argparse.ArgumentParser()
+parser.add_argument('identity', help="identity name for key derivation (e.g. user@host)")
+parser.add_argument('--timeout', help="set lifetime (in seconds) when adding identities (default 3600)", type=int, default=3600)
+parser.add_argument('--salt', help="extra salt for key derivation", default="")
+parser.add_argument('--nopass', help="use empty password for key derivation", action='store_true')
+args = parser.parse_args()
+
+if args.nopass:
+    passwd = ""
+else:
+    passwd = getpass.getpass("Password: ", sys.stderr)
+
+challenge = hashlib.sha256(args.identity + args.salt + passwd).digest()
+signature = sign_request(challenge, path)
+private_value = int(hashlib.sha256(signature).digest().encode("hex"), 16)
+
+private_key = ec.derive_private_key(private_value, ec.SECP384R1(), default_backend())
+private_key_pem = private_key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption())
+
+if args.timeout != 0:
+    ssh_add_cmd = ["ssh-add", "-t", str(args.timeout), "-"]
+else:
+    ssh_add_cmd = ["ssh-add", "-"]
+
+process = subprocess.Popen(ssh_add_cmd, stdin = subprocess.PIPE, stderr = subprocess.PIPE)
+(out,err) = process.communicate(private_key_pem)
+
+if process.returncode == 0:
+    public_key = private_key.public_key()
+    print(public_key.public_bytes(serialization.Encoding.OpenSSH, serialization.PublicFormat.OpenSSH))
+else:
+    print(out)
+    sys.stderr.write(err)
+    sys.exit(process.returncode)
